@@ -140,11 +140,15 @@ int P4d::init()
 
    w1.scan();
 
+   webRequestThread->start();
+
    return success;
 }
 
 int P4d::exit()
 {
+   webRequestThread->stop();
+
    exitDb();
    serial->close();
    curl->exit();

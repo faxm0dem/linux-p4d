@@ -45,7 +45,6 @@ cP4WebThread::cP4WebThread(P4d* parent)
 
 cP4WebThread::~cP4WebThread()
 {
-   exitDb();
    curl->exit();
 
    delete serial;
@@ -207,8 +206,22 @@ void cP4WebThread::action()
    end = no;
    mutex.Lock();
 
+   initDb();
+
    while (Running() && !end)
    {
+      // check db connection
+
+      while (Running() && !end && (!connection || !connection->isConnected()))
+      {
+         if (initDb() != success)
+         {
+            exitDb();
+            tell(eloAlways, "Retrying in 5 seconds");
+            sleep(5);
+         }
+      }
+
       waitCondition.TimedWait(mutex, 50000);
 
       performRequests();
@@ -219,6 +232,8 @@ void cP4WebThread::action()
          lastCleanup = time(0);
       }
    }
+
+   exitDb();
 }
 
 //***************************************************************************
@@ -227,9 +242,6 @@ void cP4WebThread::action()
 
 int cP4WebThread::performRequests()
 {
-   char* mailScript = 0;
-   char* stateMailTo = 0;
-
    if (!connection || !connection->isConnected())
       return fail;
 
@@ -243,9 +255,6 @@ int cP4WebThread::performRequests()
       const char* data = tableJobs->getStrValue("DATA");
       int jobId = tableJobs->getIntValue("ID");
 
-      getConfigItem("mailScript", mailScript, "/usr/local/bin/p4d-mail.sh");
-      getConfigItem("stateMailTo", stateMailTo);
-
       tableJobs->find();
       tableJobs->setValue("DONEAT", time(0));
       tableJobs->setValue("STATE", "D");
@@ -255,12 +264,17 @@ int cP4WebThread::performRequests()
 
       if (strcasecmp(command, "test-mail") == 0)
       {
+         char* mailScript = 0;
+         char* stateMailTo = 0;
          char* subject = strdup(data);
          char* body = 0;
 
          if ((body = strchr(subject, ':')))
          {
             *body = 0; body++;
+
+            getConfigItem("mailScript", mailScript, "/usr/local/bin/p4d-mail.sh");
+            getConfigItem("stateMailTo", stateMailTo);
 
             tell(eloDetail, "Test mail requested with: '%s/%s'", subject, body);
 
@@ -274,6 +288,10 @@ int cP4WebThread::performRequests()
                tableJobs->setValue("RESULT", "fail:send failed");
             else
                tableJobs->setValue("RESULT", "success:mail sended");
+         }
+         else
+         {
+            tableJobs->setValue("RESULT", "fail:invalid request syntax");
          }
       }
 
