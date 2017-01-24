@@ -11,7 +11,7 @@ HLIB      = -L. -lhorchi
 
 TEST = tst
 
-LIBOBJS = common.o db.o dbdict.o
+LIBOBJS = common.o db.o dbdict.o thread.o
 
 BASELIBS = -lrt -lz -luuid
 BASELIBS += $(shell mysql_config --libs_r)
@@ -64,6 +64,7 @@ HEADER = db.h common.h dbdict.h
 
 common.o     :  common.c      $(HEADER) common.h
 curl.o       :  curl.c        $(HEADER) curl.h
+thread.o     :  thread.c      $(HEADER) thread.h
 imgtools.o   :  imgtools.c    $(HEADER) imgtools.h
 config.o     :  config.c      $(HEADER) config.h
 db.o         :  db.c          $(HEADER) db.h

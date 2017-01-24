@@ -29,7 +29,7 @@ GIT_REV     = $(shell git describe --always 2>/dev/null)
 
 # object files
 
-LOBJS =  lib/db.o lib/dbdict.o lib/common.o lib/serial.o lib/curl.o
+LOBJS =  lib/db.o lib/dbdict.o lib/common.o lib/serial.o lib/curl.o lib/thread.o
 OBJS += $(LOBJS) main.o p4io.o service.o w1.o webif.o
 CLOBJS = $(LOBJS) chart.o
 CMDOBJS = p4cmd.o p4io.o lib/serial.o service.o w1.o lib/common.o
@@ -132,8 +132,9 @@ HEADER = lib/db.h lib/dbdict.h lib/common.h
 lib/common.o    :  lib/common.c    $(HEADER)
 lib/db.o        :  lib/db.c        $(HEADER)
 lib/dbdict.o    :  lib/dbdict.c    $(HEADER)
-lib/curl.o      :  lib/curl.c    $(HEADER)
+lib/curl.o      :  lib/curl.c      $(HEADER)
 lib/serial.o    :  lib/serial.c    $(HEADER) lib/serial.h
+lib/thread.o    :  lib/thread.c    $(HEADER)
 
 main.o			 :  main.c          $(HEADER) p4d.h
 p4d.o           :  p4d.c           $(HEADER) p4d.h p4io.h w1.h

@@ -3,17 +3,236 @@
 // File webif.c
 // This code is distributed under the terms and conditions of the
 // GNU GENERAL PUBLIC LICENSE. See the file LICENSE for details.
-// Date 04.11.2010 - 10.02.2014  Jörg Wendel
+// Date 04.11.2010 - 10.02.2017  Jörg Wendel
 //***************************************************************************
 
+#include <libxml/parser.h>
+
 #include "p4d.h"
+
+//***************************************************************************
+// Class cP4WebThread
+//***************************************************************************
+
+cP4WebThread::cP4WebThread(P4d* parent)
+   : cThread("Web Interface Thread", yes)
+{
+   p4d = parent;
+   end = no;
+   connection = 0;
+
+   tableSamples = 0;
+   tableMenu = 0;
+   tableJobs = 0;
+   tableConfig = 0;
+   tableScripts = 0;
+   tableTimeRanges = 0;
+   tableValueFacts = 0;
+   tableHmSysVars = 0;
+
+   selectPendingJobs = 0;
+   selectAllMenuItems = 0;
+   selectMaxTime = 0;
+   selectScriptByName = 0;
+   cleanupJobs = 0;
+
+   sem = new Sem(0x3da00001);
+   serial = new Serial;
+   request = new P4Request(serial);
+   curl = new cCurl();
+   curl->init();
+}
+
+cP4WebThread::~cP4WebThread()
+{
+   exitDb();
+   curl->exit();
+
+   delete serial;
+   delete request;
+   delete sem;
+   delete curl;
+}
+
+int cP4WebThread::start()
+{
+   Start(yes);
+   return success;
+}
+
+int cP4WebThread::stop()
+{
+   end = yes;
+   waitCondition.Broadcast();
+   Cancel(3);
+   return success;
+}
+
+int cP4WebThread::initDb()
+{
+   int status = success;
+
+   if (connection)
+      exitDb();
+
+   tell(eloAlways, "Try conneting to database");
+
+   connection = new cDbConnection();
+
+   // ------------------------
+   // create/open tables
+   // ------------------------
+
+   tableMenu = new cDbTable(connection, "menu");
+   if (tableMenu->open() != success) return fail;
+
+   tableSamples = new cDbTable(connection, "samples");
+   if (tableSamples->open() != success) return fail;
+
+   tableJobs = new cDbTable(connection, "jobs");
+   if (tableJobs->open() != success) return fail;
+
+   tableConfig = new cDbTable(connection, "config");
+   if (tableConfig->open() != success) return fail;
+
+   tableScripts = new cDbTable(connection, "scripts");
+   if (tableScripts->open() != success) return fail;
+
+   tableTimeRanges = new cDbTable(connection, "timeranges");
+   if (tableTimeRanges->open() != success) return fail;
+
+   tableValueFacts = new cDbTable(connection, "valuefacts");
+   if (tableValueFacts->open() != success) return fail;
+
+   tableHmSysVars = new cDbTable(connection, "hmsysvars");
+   if (tableHmSysVars->open() != success) return fail;
+
+   // ------------------
+   // prepare statements
+   // ------------------
+
+   selectPendingJobs = new cDbStatement(tableJobs);
+
+   selectPendingJobs->build("select ");
+   selectPendingJobs->bind("ID", cDBS::bndOut);
+   selectPendingJobs->bind("REQAT", cDBS::bndOut, ", ");
+   selectPendingJobs->bind("STATE", cDBS::bndOut, ", ");
+   selectPendingJobs->bind("COMMAND", cDBS::bndOut, ", ");
+   selectPendingJobs->bind("ADDRESS", cDBS::bndOut, ", ");
+   selectPendingJobs->bind("DATA", cDBS::bndOut, ", ");
+   selectPendingJobs->build(" from %s where state = 'P'", tableJobs->TableName());
+
+   status += selectPendingJobs->prepare();
+
+   // --------------------
+   // select max(time) from samples
+
+   selectMaxTime = new cDbStatement(tableSamples);
+
+   selectMaxTime->build("select ");
+   selectMaxTime->bind("TIME", cDBS::bndOut, "max(");
+   selectMaxTime->build(") from %s", tableSamples->TableName());
+
+   status += selectMaxTime->prepare();
+
+   // ----------------
+
+   selectAllMenuItems = new cDbStatement(tableMenu);
+
+   selectAllMenuItems->build("select ");
+   selectAllMenuItems->bindAllOut();
+   selectAllMenuItems->build(" from %s", tableMenu->TableName());
+
+   status += selectAllMenuItems->prepare();
+
+   // ------------------
+
+   selectScriptByName = new cDbStatement(tableScripts);
+
+   selectScriptByName->build("select ");
+   selectScriptByName->bindAllOut();
+   selectScriptByName->build(" from %s where ", tableScripts->TableName());
+   selectScriptByName->bind("NAME", cDBS::bndIn | cDBS::bndSet);
+
+   status += selectScriptByName->prepare();
+
+   // ------------------
+
+   cleanupJobs = new cDbStatement(tableJobs);
+
+   cleanupJobs->build("delete from %s where ", tableJobs->TableName());
+   cleanupJobs->bindCmp(0, "REQAT", 0, "<");
+
+   status += cleanupJobs->prepare();
+
+   // ------------------
+
+   if (status == success)
+      tell(eloAlways, "Connection to database established");
+
+   return status;
+}
+
+int cP4WebThread::exitDb()
+{
+   delete tableSamples;            tableSamples = 0;
+   delete tableMenu;               tableMenu = 0;
+   delete tableJobs;               tableJobs = 0;
+   delete tableConfig;             tableConfig = 0;
+   delete tableScripts;            tableScripts = 0;
+   delete tableTimeRanges;         tableTimeRanges = 0;
+   delete tableValueFacts;         tableValueFacts = 0;
+   delete tableHmSysVars;          tableHmSysVars = 0;
+
+   delete selectPendingJobs;       selectPendingJobs = 0;
+   delete selectAllMenuItems;      selectAllMenuItems = 0;
+   delete selectMaxTime;           selectMaxTime = 0;
+   delete selectScriptByName;      selectScriptByName = 0;
+   delete cleanupJobs;             cleanupJobs = 0;
+
+   delete connection;              connection = 0;
+
+   return done;
+}
+
+//***************************************************************************
+// Action
+//***************************************************************************
+
+void cP4WebThread::action()
+{
+   static time_t lastCleanup = time(0);
+   cMyMutex mutex;
+
+   end = no;
+   mutex.Lock();
+
+   while (Running() && !end)
+   {
+      waitCondition.TimedWait(mutex, 50000);
+
+      performRequests();
+
+      if (lastCleanup < time(0) - 6*tmeSecondsPerHour)
+      {
+         cleanupWebifRequests();
+         lastCleanup = time(0);
+      }
+   }
+}
 
 //***************************************************************************
 // Perform WEBIF Requests
 //***************************************************************************
 
-int P4d::performWebifRequests()
+int cP4WebThread::performRequests()
 {
+   char* mailScript = 0;
+   char* stateMailTo = 0;
+
+   if (!connection || !connection->isConnected())
+      return fail;
+
    tableJobs->clear();
 
    for (int f = selectPendingJobs->find(); f; f = selectPendingJobs->fetch())
@@ -23,6 +242,9 @@ int P4d::performWebifRequests()
       const char* command = tableJobs->getStrValue("COMMAND");
       const char* data = tableJobs->getStrValue("DATA");
       int jobId = tableJobs->getIntValue("ID");
+
+      getConfigItem("mailScript", mailScript, "/usr/local/bin/p4d-mail.sh");
+      getConfigItem("stateMailTo", stateMailTo);
 
       tableJobs->find();
       tableJobs->setValue("DONEAT", time(0));
@@ -61,35 +283,8 @@ int P4d::performWebifRequests()
 
          tell(eloDetail, "Test mail for alert (%d) requested", id);
 
-         if (isEmpty(mailScript))
-            tableJobs->setValue("RESULT", "fail:missing mailscript");
-         else if (!fileExists(mailScript))
-            tableJobs->setValue("RESULT", "fail:mail-script not found");
-         else
-         {
-            time_t last;
-
-            if (!selectMaxTime->find())
-               tell(eloAlways, "Warning: Got no result by 'select max(time) from samples'");
-
-            last = tableSamples->getTimeValue("TIME");
-            selectMaxTime->freeResult();
-
-            tableSensorAlert->clear();
-            tableSensorAlert->setValue("ID", id);
-
-            alertMailBody = "";
-            alertMailSubject = "";
-
-            if (!tableSensorAlert->find())
-               tableJobs->setValue("RESULT", "fail:requested alert ID not found");
-            else if (!performAlertCheck(tableSensorAlert->getRow(), last, 0, yes/*force*/))
-               tableJobs->setValue("RESULT", "fail:send failed");
-            else
-               tableJobs->setValue("RESULT", "success:mail sended");
-
-            tableSensorAlert->reset();
-         }
+         p4d->triggerAlertCheckTestMailFor = id;
+         tableJobs->setValue("RESULT", "success:check mail triggert");
       }
 
       else if (strcasecmp(command, "check-login") == 0)
@@ -142,7 +337,7 @@ int P4d::performWebifRequests()
 
       else if (strcasecmp(command, "update-schemacfg") == 0)
       {
-         updateSchemaConfTable();
+         p4d->triggerUpdateSchemaConf = yes;
          tableJobs->setValue("RESULT", "success:done");
       }
 
@@ -164,7 +359,7 @@ int P4d::performWebifRequests()
 
          // read the config from table to apply changes
 
-         readConfiguration();
+         p4d->triggerUpdateConfig = yes;
       }
 
       else if (strcasecmp(command, "read-config") == 0)
@@ -202,7 +397,7 @@ int P4d::performWebifRequests()
 
             ConfigParameter p(paddr);
 
-            if (request->getParameter(&p) == success)
+            if (getParameter(&p) == success)
             {
                char* buf = 0;
                cRetBuf value = ConfigParameter::toNice(p.value, type);
@@ -241,7 +436,7 @@ int P4d::performWebifRequests()
             {
                tell(eloAlways, "Storing value '%s/%d' for parameter at address 0x%x", data, p.value, paddr);
 
-               if ((status = request->setParameter(&p)) == success)
+               if ((status = setParameter(&p)) == success)
                {
                   char* buf = 0;
                   cRetBuf value = ConfigParameter::toNice(p.value, type);
@@ -286,11 +481,8 @@ int P4d::performWebifRequests()
 
       else if (strcasecmp(command, "gettrp") == 0)
       {
-         // first update the time range data
-         //  s3200 support no single request of a time range parameter
-
          // don't update since it takes to long (assume table is up to date)
-         // updateTimeRangeData();
+         // ### updateTimeRangeData();
 
          // now read it from the table
 
@@ -360,7 +552,7 @@ int P4d::performWebifRequests()
             {
                tell(eloAlways, "Storing '%s' for time range '%d' of parameter 0x%x", t.getTimeRange(rangeNo), rangeNo+1, t.address);
 
-               if ((status = request->setTimeRanges(&t)) == success)
+               if ((status = setTimeRanges(&t)) == success)
                {
                   char* buf = 0;
 
@@ -416,7 +608,7 @@ int P4d::performWebifRequests()
             double factor = tableValueFacts->getIntValue("FACTOR");
             const char* unit = tableValueFacts->getStrValue("UNIT");
 
-            if (request->getValue(&v) == success)
+            if (getValue(&v) == success)
             {
                char* buf = 0;
 
@@ -429,7 +621,7 @@ int P4d::performWebifRequests()
 
       else if (strcasecmp(command, "initmenu") == 0)
       {
-         initMenu();
+         p4d->triggerInitMenu = yes;
          tableJobs->setValue("RESULT", "success:done");
       }
 
@@ -451,9 +643,9 @@ int P4d::performWebifRequests()
          char* buf;
 
          memset(averages, 0, sizeof(averages));
-         localtime_r(&nextAt, &tim);
+         localtime_r(&(p4d->nextAt), &tim);
          strftime(dt, 10, "%H:%M:%S", &tim);
-         toElapsed(time(0)-startedAt, d);
+         toElapsed(time(0)-p4d->startedAt, d);
 
          getloadavg(averages, 3);
 
@@ -470,12 +662,12 @@ int P4d::performWebifRequests()
          char date[100];
          char* buf = 0;
 
-         localtime_r(&currentState.time, &tim);
+         localtime_r(&(p4d->currentState.time), &tim);
          strftime(date, 100, "%A, %d. %b. %G %H:%M:%S", &tim);
 
          asprintf(&buf, "success:%s#%d#%s#%s", date,
-                  currentState.state, currentState.stateinfo,
-                  currentState.modeinfo);
+                  p4d->currentState.state, p4d->currentState.stateinfo,
+                  p4d->currentState.modeinfo);
 
          tableJobs->setValue("RESULT", buf);
          free(buf);
@@ -483,7 +675,7 @@ int P4d::performWebifRequests()
 
       else if (strcasecmp(command, "initvaluefacts") == 0)
       {
-         updateValueFacts();
+         p4d->triggerUpdateValueFacts = yes;
          tableJobs->setValue("RESULT", "success:done");
       }
 
@@ -491,122 +683,7 @@ int P4d::performWebifRequests()
       {
          tableMenu->clear();
 
-         for (int f = selectAllMenuItems->find(); f; f = selectAllMenuItems->fetch())
-         {
-            int type = tableMenu->getIntValue("TYPE");
-            int paddr = tableMenu->getIntValue("ADDRESS");
-
-            if (type == 0x07 || type == 0x08 || type == 0x0a ||
-                type == 0x40 || type == 0x39 || type == 0x32)
-            {
-               Fs::ConfigParameter p(paddr);
-
-               if (request->getParameter(&p) == success)
-               {
-                  cRetBuf value = ConfigParameter::toNice(p.value, type);
-
-                  if (tableMenu->find())
-                  {
-                     tableMenu->setValue("VALUE", value);
-                     tableMenu->setValue("UNIT", p.unit);
-                     tableMenu->update();
-                  }
-               }
-            }
-
-            else if (type == mstFirmware)
-            {
-               Fs::Status s;
-
-               if (request->getStatus(&s) == success)
-               {
-                  if (tableMenu->find())
-                  {
-                     tableMenu->setValue("VALUE", s.version);
-                     tableMenu->setValue("UNIT", "");
-                     tableMenu->update();
-                  }
-               }
-            }
-
-            else if (type == mstDigOut || type == mstDigIn || type == mstAnlOut)
-            {
-               int status;
-               Fs::IoValue v(paddr);
-
-               if (type == mstDigOut)
-                  status = request->getDigitalOut(&v);
-               else if (type == mstDigIn)
-                  status = request->getDigitalIn(&v);
-               else
-                  status = request->getAnalogOut(&v);
-
-               if (status == success)
-               {
-                  char* buf = 0;
-
-                  if (type == mstAnlOut)
-                  {
-                     if (v.mode == 0xff)
-                        asprintf(&buf, "%d (A)", v.state);
-                     else
-                        asprintf(&buf, "%d (%d)", v.state, v.mode);
-                  }
-                  else
-                     asprintf(&buf, "%s (%c)", v.state ? "on" : "off", v.mode);
-
-                  if (tableMenu->find())
-                  {
-                     tableMenu->setValue("VALUE", buf);
-                     tableMenu->setValue("UNIT", "");
-                     tableMenu->update();
-                  }
-
-                  free(buf);
-               }
-            }
-
-            else if (type == mstMesswert || type == mstMesswert1)
-            {
-               int status;
-               Fs::Value v(paddr);
-
-               tableValueFacts->clear();
-               tableValueFacts->setValue("TYPE", "VA");
-               tableValueFacts->setValue("ADDRESS", paddr);
-
-               if (tableValueFacts->find())
-               {
-                  double factor = tableValueFacts->getIntValue("FACTOR");
-                  const char* unit = tableValueFacts->getStrValue("UNIT");
-
-                  status = request->getValue(&v);
-
-                  if (status == success)
-                  {
-                     char* buf = 0;
-                     asprintf(&buf, "%.2f", v.value / factor);
-
-                     if (tableMenu->find())
-                     {
-                        tableMenu->setValue("VALUE", buf);
-
-                        if (strcmp(unit, "°") == 0)
-                           tableMenu->setValue("UNIT", "°C");
-                        else
-                           tableMenu->setValue("UNIT", unit);
-
-                        tableMenu->update();
-                     }
-
-                     free(buf);
-                  }
-               }
-            }
-         }
-
-         selectAllMenuItems->freeResult();
-
+         updateMenu();
          updateTimeRangeData();
 
          tableJobs->setValue("RESULT", "success:done");
@@ -631,43 +708,10 @@ int P4d::performWebifRequests()
 }
 
 //***************************************************************************
-// Update Time Range Data
-//***************************************************************************
-
-int P4d::updateTimeRangeData()
-{
-   Fs::TimeRanges t;
-   int status;
-   char fName[10+TB];
-   char tName[10+TB];
-
-   // update / insert time ranges
-
-   for (status = request->getFirstTimeRanges(&t); status != Fs::wrnLast; status = request->getNextTimeRanges(&t))
-   {
-      tableTimeRanges->clear();
-      tableTimeRanges->setValue("ADDRESS", t.address);
-
-      for (int n = 0; n < 4; n++)
-      {
-         sprintf(fName, "FROM%d", n+1);
-         sprintf(tName, "TO%d", n+1);
-         tableTimeRanges->setValue(fName, t.getTimeRangeFrom(n));
-         tableTimeRanges->setValue(tName, t.getTimeRangeTo(n));
-      }
-
-      tableTimeRanges->store();
-      tableTimeRanges->reset();
-   }
-
-   return done;
-}
-
-//***************************************************************************
 // Cleanup WEBIF Requests
 //***************************************************************************
 
-int P4d::cleanupWebifRequests()
+int cP4WebThread::cleanupWebifRequests()
 {
    int status;
 
@@ -686,7 +730,7 @@ int P4d::cleanupWebifRequests()
 // Call Script
 //***************************************************************************
 
-int P4d::callScript(const char* scriptName, const char*& result)
+int cP4WebThread::callScript(const char* scriptName, const char*& result)
 {
    int status;
    const char* path;
@@ -721,6 +765,384 @@ int P4d::callScript(const char* scriptName, const char*& result)
    }
 
    tell(eloAlways, "Called script '%s' at path '%s', exit status was (%d)", scriptName, path, status);
+
+   return success;
+}
+
+//***************************************************************************
+// Stored Parameters
+//***************************************************************************
+
+int cP4WebThread::getConfigItem(const char* name, char*& value, const char* def)
+{
+   free(value);
+   value = 0;
+
+   tableConfig->clear();
+   tableConfig->setValue("OWNER", "p4d");
+   tableConfig->setValue("NAME", name);
+
+   if (tableConfig->find())
+      value = strdup(tableConfig->getStrValue("VALUE"));
+   else
+   {
+      value = strdup(def);
+      setConfigItem(name, value);  // store the default
+   }
+
+   tableConfig->reset();
+
+   return success;
+}
+
+int cP4WebThread::setConfigItem(const char* name, const char* value)
+{
+   tell(eloAlways, "Storing '%s' with value '%s'", name, value);
+   tableConfig->clear();
+   tableConfig->setValue("OWNER", "p4d");
+   tableConfig->setValue("NAME", name);
+   tableConfig->setValue("VALUE", value);
+
+   return tableConfig->store();
+}
+
+//***************************************************************************
+// Send Mail
+//***************************************************************************
+
+int cP4WebThread::sendMail(const char* receiver, const char* subject, const char* body, const char* mimeType)
+{
+   char* command = 0;
+   char* mailScript = 0;
+
+   getConfigItem("mailScript", mailScript, "/usr/local/bin/p4d-mail.sh");
+
+   asprintf(&command, "%s '%s' '%s' '%s' %s", mailScript,
+            subject, body, mimeType, receiver);
+
+   system(command);
+   free(command);
+
+   tell(eloAlways, "Send mail '%s' with [%s] to '%s'",
+        subject, body, receiver);
+
+   return done;
+}
+
+//***************************************************************************
+//
+//***************************************************************************
+
+int cP4WebThread::getParameter(ConfigParameter* p)
+{
+   int status;
+   SemLock lock(sem);
+
+   if (serial->open(ttyDeviceSvc) != success)
+      return fail;
+
+   status = request->getParameter(p);
+
+   serial->close();
+
+   return status;
+}
+
+int cP4WebThread::setParameter(ConfigParameter* p)
+{
+   int status;
+   SemLock lock(sem);
+
+   if (serial->open(ttyDeviceSvc) != success)
+      return fail;
+
+   status = request->setParameter(p);
+
+   serial->close();
+
+   return status;
+}
+
+int cP4WebThread::setTimeRanges(TimeRanges* t)
+{
+   int status;
+   SemLock lock(sem);
+
+   if (serial->open(ttyDeviceSvc) != success)
+      return fail;
+
+   status = request->setTimeRanges(t);
+
+   serial->close();
+
+   return status;
+}
+
+int cP4WebThread::getValue(Value* v)
+{
+   int status;
+   SemLock lock(sem);
+
+   if (serial->open(ttyDeviceSvc) != success)
+      return fail;
+
+   status = request->getValue(v);
+
+   serial->close();
+
+   return status;
+}
+
+int cP4WebThread::updateMenu()
+{
+   SemLock lock(sem);
+
+   if (serial->open(ttyDeviceSvc) != success)
+      return fail;
+
+   tableMenu->clear();
+
+   for (int f = selectAllMenuItems->find(); f; f = selectAllMenuItems->fetch())
+   {
+      int type = tableMenu->getIntValue("TYPE");
+      int paddr = tableMenu->getIntValue("ADDRESS");
+
+
+      if (type == 0x07 || type == 0x08 || type == 0x0a ||
+          type == 0x40 || type == 0x39 || type == 0x32)
+      {
+         Fs::ConfigParameter p(paddr);
+
+         if (request->getParameter(&p) == success)
+         {
+            cRetBuf value = ConfigParameter::toNice(p.value, type);
+
+            if (tableMenu->find())
+            {
+               tableMenu->setValue("VALUE", value);
+               tableMenu->setValue("UNIT", p.unit);
+               tableMenu->update();
+            }
+         }
+      }
+
+      else if (type == mstFirmware)
+      {
+         Fs::Status s;
+
+         if (request->getStatus(&s) == success)
+         {
+            if (tableMenu->find())
+            {
+               tableMenu->setValue("VALUE", s.version);
+               tableMenu->setValue("UNIT", "");
+               tableMenu->update();
+            }
+         }
+      }
+
+      else if (type == mstDigOut || type == mstDigIn || type == mstAnlOut)
+      {
+         int status;
+         Fs::IoValue v(paddr);
+
+         if (type == mstDigOut)
+            status = request->getDigitalOut(&v);
+         else if (type == mstDigIn)
+            status = request->getDigitalIn(&v);
+         else
+            status = request->getAnalogOut(&v);
+
+         if (status == success)
+         {
+            char* buf = 0;
+
+            if (type == mstAnlOut)
+            {
+               if (v.mode == 0xff)
+                  asprintf(&buf, "%d (A)", v.state);
+               else
+                  asprintf(&buf, "%d (%d)", v.state, v.mode);
+            }
+            else
+               asprintf(&buf, "%s (%c)", v.state ? "on" : "off", v.mode);
+
+            if (tableMenu->find())
+            {
+               tableMenu->setValue("VALUE", buf);
+               tableMenu->setValue("UNIT", "");
+               tableMenu->update();
+            }
+
+            free(buf);
+         }
+      }
+
+      else if (type == mstMesswert || type == mstMesswert1)
+      {
+         int status;
+         Fs::Value v(paddr);
+
+         tableValueFacts->clear();
+         tableValueFacts->setValue("TYPE", "VA");
+         tableValueFacts->setValue("ADDRESS", paddr);
+
+         if (tableValueFacts->find())
+         {
+            double factor = tableValueFacts->getIntValue("FACTOR");
+            const char* unit = tableValueFacts->getStrValue("UNIT");
+
+            status = request->getValue(&v);
+
+            if (status == success)
+            {
+               char* buf = 0;
+               asprintf(&buf, "%.2f", v.value / factor);
+
+               if (tableMenu->find())
+               {
+                  tableMenu->setValue("VALUE", buf);
+
+                  if (strcmp(unit, "°") == 0)
+                     tableMenu->setValue("UNIT", "°C");
+                  else
+                     tableMenu->setValue("UNIT", unit);
+
+                  tableMenu->update();
+               }
+
+               free(buf);
+            }
+         }
+            }
+   }
+
+   selectAllMenuItems->freeResult();
+   serial->close();
+
+   return done;
+}
+
+//***************************************************************************
+// Update Time Range Data
+//***************************************************************************
+
+int cP4WebThread::updateTimeRangeData()
+{
+   Fs::TimeRanges t;
+   int status;
+   char fName[10+TB];
+   char tName[10+TB];
+   SemLock lock(sem);
+
+   // update / insert time ranges
+
+   for (status = request->getFirstTimeRanges(&t); status != Fs::wrnLast; status = request->getNextTimeRanges(&t))
+   {
+      tableTimeRanges->clear();
+      tableTimeRanges->setValue("ADDRESS", t.address);
+
+      for (int n = 0; n < 4; n++)
+      {
+         sprintf(fName, "FROM%d", n+1);
+         sprintf(tName, "TO%d", n+1);
+         tableTimeRanges->setValue(fName, t.getTimeRangeFrom(n));
+         tableTimeRanges->setValue(tName, t.getTimeRangeTo(n));
+      }
+
+      tableTimeRanges->store();
+      tableTimeRanges->reset();
+   }
+
+   return done;
+}
+
+//***************************************************************************
+// Synchronize HM System Variables
+//***************************************************************************
+
+int cP4WebThread::hmSyncSysVars()
+{
+   char* hmUrl = 0;
+   char* hmHost = 0;
+   xmlDoc* document = 0;
+   xmlNode* root = 0;
+   int readOptions = 0;
+   MemoryStruct data;
+   int count = 0;
+   int size = 0;
+
+#if LIBXML_VERSION >= 20900
+   readOptions |=  XML_PARSE_HUGE;
+#endif
+
+   getConfigItem("hmHost", hmHost, "");
+
+   if (isEmpty(hmHost))
+      return done;
+
+   tell(eloAlways, "Updating HomeMatic system variables");
+   asprintf(&hmUrl, "http://%s/config/xmlapi/sysvarlist.cgi", hmHost);
+
+   if (curl->downloadFile(hmUrl, size, &data) != success)
+   {
+      tell(0, "Error: Requesting sysvar list at homematic '%s' failed", hmUrl);
+      free(hmUrl);
+      return fail;
+   }
+
+   free(hmUrl);
+
+   tell(3, "Got [%s]", data.memory ? data.memory : "<null>");
+
+   if (document = xmlReadMemory(data.memory, data.size, "", 0, readOptions))
+      root = xmlDocGetRootElement(document);
+
+   if (!root)
+   {
+      tell(0, "Error: Failed to parse XML document [%s]", data.memory ? data.memory : "<null>");
+      return fail;
+   }
+
+   for (xmlNode* node = root->children; node; node = node->next)
+   {
+      xmlChar* id = xmlGetProp(node, (xmlChar*)"ise_id");
+      xmlChar* name = xmlGetProp(node, (xmlChar*)"name");
+      xmlChar* type = xmlGetProp(node, (xmlChar*)"type");
+      xmlChar* unit = xmlGetProp(node, (xmlChar*)"unit");
+      xmlChar* visible = xmlGetProp(node, (xmlChar*)"visible");
+      xmlChar* min = xmlGetProp(node, (xmlChar*)"min");
+      xmlChar* max = xmlGetProp(node, (xmlChar*)"max");
+      xmlChar* time = xmlGetProp(node, (xmlChar*)"timestamp");
+      xmlChar* value = xmlGetProp(node, (xmlChar*)"value");
+
+      tableHmSysVars->clear();
+      tableHmSysVars->setValue("ID", atol((const char*)id));
+      tableHmSysVars->find();
+      tableHmSysVars->setValue("NAME", (const char*)name);
+      tableHmSysVars->setValue("TYPE", atol((const char*)type));
+      tableHmSysVars->setValue("UNIT", (const char*)unit);
+      tableHmSysVars->setValue("VISIBLE", strcmp((const char*)visible, "true") == 0);
+      tableHmSysVars->setValue("MIN", (const char*)min);
+      tableHmSysVars->setValue("MAX", (const char*)max);
+      tableHmSysVars->setValue("TIME", atol((const char*)time));
+      tableHmSysVars->setValue("VALUE", (const char*)value);
+      tableHmSysVars->store();
+
+      xmlFree(id);
+      xmlFree(name);
+      xmlFree(type);
+      xmlFree(unit);
+      xmlFree(visible);
+      xmlFree(min);
+      xmlFree(max);
+      xmlFree(time);
+      xmlFree(value);
+
+      count++;
+   }
+
+   tell(eloAlways, "Upate of (%d) HomeMatic system variables succeeded", count);
 
    return success;
 }

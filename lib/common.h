@@ -273,14 +273,14 @@ class cRetBuf
 };
 
 //***************************************************************************
-// cTimeMs
+// cMyTimeMs
 //***************************************************************************
 
-class cTimeMs
+class cMyTimeMs
 {
    public:
 
-      cTimeMs(int Ms = 0);
+      cMyTimeMs(int Ms = 0);
       static uint64_t Now();
       void Set(int Ms = 0);
       bool TimedOut();
@@ -427,6 +427,26 @@ class Sem
       int key;
       int id;
       int locked;
+};
+
+class SemLock
+{
+   public:
+
+     SemLock(Sem* s)
+     {
+        sem = s;
+        sem->p();
+     }
+
+     ~SemLock()
+     {
+        sem->v();
+     }
+
+   private:
+
+      Sem* sem;
 };
 
 //***************************************************************************

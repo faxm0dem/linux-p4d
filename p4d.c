@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <libxml/parser.h>
 
 #include "p4d.h"
 
@@ -27,7 +26,7 @@ P4d::P4d()
 {
    connection = 0;
    tableSamples = 0;
-   tableJobs = 0;
+
    tableSensorAlert = 0;
    tableSchemaConf = 0;
    tableSmartConf = 0;
@@ -37,7 +36,7 @@ P4d::P4d()
    tableErrors = 0;
    tableTimeRanges = 0;
    tableScripts = 0;
-   selectHmSysVarByAddr = 0;
+   tableHmSysVars = 0;
 
    selectActiveValueFacts = 0;
    selectAllValueFacts = 0;
@@ -48,14 +47,19 @@ P4d::P4d()
    selectPendingErrors = 0;
    selectMaxTime = 0;
    selectHmSysVarByAddr = 0;
-   selectScriptByName = 0;
    selectScript = 0;
-   cleanupJobs = 0;
+   selectHmSysVarByAddr = 0;
 
    nextAt = time(0);           // intervall for 'reading values'
    startedAt = time(0);
    nextAggregateAt = 0;
    nextTimeSyncAt = 0;
+
+   triggerAlertCheckTestMailFor = na;
+   triggerUpdateSchemaConf = no;
+   triggerUpdateConfig = no;
+   triggerInitMenu = no;
+   triggerUpdateValueFacts = no;
 
    mailBody = "";
    mailBodyHtml = "";
@@ -81,6 +85,8 @@ P4d::P4d()
    serial = new Serial;
    request = new P4Request(serial);
    curl = new cCurl();
+
+   webRequestThread = new cP4WebThread(this);
 }
 
 P4d::~P4d()
@@ -227,9 +233,6 @@ int P4d::initDb()
    tableSamples = new cDbTable(connection, "samples");
    if (tableSamples->open() != success) return fail;
 
-   tableJobs = new cDbTable(connection, "jobs");
-   if (tableJobs->open() != success) return fail;
-
    tableSensorAlert = new cDbTable(connection, "sensoralert");
    if (tableSensorAlert->open() != success) return fail;
 
@@ -281,21 +284,6 @@ int P4d::initDb()
    selectAllMenuItems->build(" from %s", tableMenu->TableName());
 
    status += selectAllMenuItems->prepare();
-
-   // ------------------
-
-   selectPendingJobs = new cDbStatement(tableJobs);
-
-   selectPendingJobs->build("select ");
-   selectPendingJobs->bind("ID", cDBS::bndOut);
-   selectPendingJobs->bind("REQAT", cDBS::bndOut, ", ");
-   selectPendingJobs->bind("STATE", cDBS::bndOut, ", ");
-   selectPendingJobs->bind("COMMAND", cDBS::bndOut, ", ");
-   selectPendingJobs->bind("ADDRESS", cDBS::bndOut, ", ");
-   selectPendingJobs->bind("DATA", cDBS::bndOut, ", ");
-   selectPendingJobs->build(" from %s where state = 'P'", tableJobs->TableName());
-
-   status += selectPendingJobs->prepare();
 
    // ------------------
 
@@ -371,17 +359,6 @@ int P4d::initDb()
 
    // ------------------
 
-   selectScriptByName = new cDbStatement(tableScripts);
-
-   selectScriptByName->build("select ");
-   selectScriptByName->bindAllOut();
-   selectScriptByName->build(" from %s where ", tableScripts->TableName());
-   selectScriptByName->bind("NAME", cDBS::bndIn | cDBS::bndSet);
-
-   status += selectScriptByName->prepare();
-
-   // ------------------
-
    selectScript = new cDbStatement(tableScripts);
 
    selectScript->build("select ");
@@ -390,15 +367,6 @@ int P4d::initDb()
    selectScript->bind("PATH", cDBS::bndIn | cDBS::bndSet);
 
    status += selectScript->prepare();
-
-   // ------------------
-
-   cleanupJobs = new cDbStatement(tableJobs);
-
-   cleanupJobs->build("delete from %s where ", tableJobs->TableName());
-   cleanupJobs->bindCmp(0, "REQAT", 0, "<");
-
-   status += cleanupJobs->prepare();
 
    // ------------------
 
@@ -415,7 +383,6 @@ int P4d::exitDb()
    delete tableSamples;            tableSamples = 0;
    delete tableValueFacts;         tableValueFacts = 0;
    delete tableMenu;               tableMenu = 0;
-   delete tableJobs;               tableJobs = 0;
    delete tableSensorAlert;        tableSensorAlert = 0;
    delete tableSchemaConf;         tableSchemaConf = 0;
    delete tableSmartConf;          tableSmartConf = 0;
@@ -433,9 +400,7 @@ int P4d::exitDb()
    delete selectSampleInRange;     selectSampleInRange = 0;
    delete selectPendingErrors;     selectPendingErrors = 0;
    delete selectMaxTime;           selectMaxTime = 0;
-   delete selectScriptByName;      selectScriptByName = 0;
    delete selectScript;            selectScript = 0;
-   delete cleanupJobs;             cleanupJobs = 0;
 
    delete connection;              connection = 0;
 
@@ -497,13 +462,8 @@ int P4d::initialize(int truncate)
       tableMenu->truncate();
    }
 
-   sem->p();
-
    if (serial->open(ttyDeviceSvc) != success)
-   {
-      sem->v();
       return fail;
-   }
 
    tell(eloAlways, "Requesting value facts from s 3200");
    updateValueFacts();
@@ -513,8 +473,6 @@ int P4d::initialize(int truncate)
    initMenu();
 
    serial->close();
-
-   sem->v();
 
    return done;
 }
@@ -626,6 +584,7 @@ int P4d::updateValueFacts()
    int count;
    int added;
    int modified;
+   SemLock lock(sem);
 
    // check serial communication
 
@@ -879,96 +838,6 @@ int P4d::updateScripts()
 }
 
 //***************************************************************************
-// Synchronize HM System Variables
-//***************************************************************************
-
-int P4d::hmSyncSysVars()
-{
-   char* hmUrl = 0;
-   char* hmHost = 0;
-   xmlDoc* document = 0;
-   xmlNode* root = 0;
-   int readOptions = 0;
-   MemoryStruct data;
-   int count = 0;
-   int size = 0;
-
-#if LIBXML_VERSION >= 20900
-   readOptions |=  XML_PARSE_HUGE;
-#endif
-
-   getConfigItem("hmHost", hmHost, "");
-
-   if (isEmpty(hmHost))
-      return done;
-
-   tell(eloAlways, "Updating HomeMatic system variables");
-   asprintf(&hmUrl, "http://%s/config/xmlapi/sysvarlist.cgi", hmHost);
-
-   if (curl->downloadFile(hmUrl, size, &data) != success)
-   {
-      tell(0, "Error: Requesting sysvar list at homematic '%s' failed", hmUrl);
-      free(hmUrl);
-      return fail;
-   }
-
-   free(hmUrl);
-
-   tell(3, "Got [%s]", data.memory ? data.memory : "<null>");
-
-   if (document = xmlReadMemory(data.memory, data.size, "", 0, readOptions))
-      root = xmlDocGetRootElement(document);
-
-   if (!root)
-   {
-      tell(0, "Error: Failed to parse XML document [%s]", data.memory ? data.memory : "<null>");
-      return fail;
-   }
-
-   for (xmlNode* node = root->children; node; node = node->next)
-   {
-      xmlChar* id = xmlGetProp(node, (xmlChar*)"ise_id");
-      xmlChar* name = xmlGetProp(node, (xmlChar*)"name");
-      xmlChar* type = xmlGetProp(node, (xmlChar*)"type");
-      xmlChar* unit = xmlGetProp(node, (xmlChar*)"unit");
-      xmlChar* visible = xmlGetProp(node, (xmlChar*)"visible");
-      xmlChar* min = xmlGetProp(node, (xmlChar*)"min");
-      xmlChar* max = xmlGetProp(node, (xmlChar*)"max");
-      xmlChar* time = xmlGetProp(node, (xmlChar*)"timestamp");
-      xmlChar* value = xmlGetProp(node, (xmlChar*)"value");
-
-      tableHmSysVars->clear();
-      tableHmSysVars->setValue("ID", atol((const char*)id));
-      tableHmSysVars->find();
-      tableHmSysVars->setValue("NAME", (const char*)name);
-      tableHmSysVars->setValue("TYPE", atol((const char*)type));
-      tableHmSysVars->setValue("UNIT", (const char*)unit);
-      tableHmSysVars->setValue("VISIBLE", strcmp((const char*)visible, "true") == 0);
-      tableHmSysVars->setValue("MIN", (const char*)min);
-      tableHmSysVars->setValue("MAX", (const char*)max);
-      tableHmSysVars->setValue("TIME", atol((const char*)time));
-      tableHmSysVars->setValue("VALUE", (const char*)value);
-      tableHmSysVars->store();
-
-      xmlFree(id);
-      xmlFree(name);
-      xmlFree(type);
-      xmlFree(unit);
-      xmlFree(visible);
-      xmlFree(min);
-      xmlFree(max);
-      xmlFree(time);
-      xmlFree(value);
-
-      count++;
-   }
-
-   tell(eloAlways, "Upate of (%d) HomeMatic system variables succeeded", count);
-
-   return success;
-}
-
-//***************************************************************************
 // Initialize Menu Structure
 //***************************************************************************
 
@@ -977,6 +846,7 @@ int P4d::initMenu()
    int status;
    Fs::MenuItem m;
    int count = 0;
+   SemLock lock(sem);
 
    // check serial communication
 
@@ -1162,17 +1032,34 @@ int P4d::standbyUntil(time_t until)
 
 int P4d::meanwhile()
 {
-   static time_t lastCleanup = time(0);
-
-   if (!connection || !connection->isConnected())
-      return fail;
-
-   performWebifRequests();
-
-   if (lastCleanup < time(0) - 6*tmeSecondsPerHour)
+   if (triggerAlertCheckTestMailFor != na)
    {
-      cleanupWebifRequests();
-      lastCleanup = time(0);
+      performAlertCheckTest();
+      triggerAlertCheckTestMailFor = na;
+   }
+
+   if (triggerUpdateSchemaConf)
+   {
+      updateSchemaConfTable();
+      triggerUpdateSchemaConf = no;
+   }
+
+   if (triggerUpdateConfig)
+   {
+      readConfiguration();
+      triggerUpdateConfig = no;
+   }
+
+   if (triggerInitMenu)
+   {
+      initMenu();
+      triggerInitMenu = no;
+   }
+
+   if (triggerUpdateValueFacts)
+   {
+      updateValueFacts();
+      triggerUpdateValueFacts = no;
    }
 
    return done;
@@ -1200,9 +1087,7 @@ int P4d::loop()
 
    scheduleAggregate();
 
-   sem->p();
    serial->open(ttyDeviceSvc);
-   sem->v();
 
    while (!doShutDown())
    {
@@ -1236,17 +1121,16 @@ int P4d::loop()
 
       if (status != success)
       {
-         sem->p();
          serial->close();
          tell(eloAlways, "Error reading serial interface, reopen now!");
          status = serial->open(ttyDeviceSvc);
-         sem->v();
 
          if (status != success)
          {
             tell(eloAlways, "Retrying in 10 seconds");
             standby(10);
          }
+
          continue;
       }
 
@@ -1289,9 +1173,7 @@ int P4d::loop()
       mailBody = "";
       mailBodyHtml = "";
 
-      sem->p();
       update();
-
       updateErrors();
       afterUpdate();
 
@@ -1302,8 +1184,6 @@ int P4d::loop()
 
       if (errorsPending)
          sendErrorMail();
-
-      sem->v();
    }
 
    serial->close();
@@ -1321,14 +1201,13 @@ int P4d::updateState(Status* state)
 
    int status;
    time_t now;
+   SemLock lock(sem);
 
    // get state
 
-   sem->p();
    tell(eloDetail, "Checking state ...");
    status = request->getStatus(state);
    now = time(0);
-   sem->v();
 
    if (status != success)
       return status;
@@ -1356,8 +1235,6 @@ int P4d::updateState(Status* state)
 
          tell(eloAlways, "Time drift is %ld seconds, syncing now", state->time - now);
 
-         sem->p();
-
          if (request->syncTime() == success)
             tell(eloAlways, "Time sync succeeded");
          else
@@ -1367,8 +1244,6 @@ int P4d::updateState(Status* state)
 
          status = request->getStatus(state);
          now = time(0);
-
-         sem->v();
 
          tell(eloAlways, "Time drift now %ld seconds", state->time - now);
       }
@@ -1387,6 +1262,7 @@ int P4d::update()
    int count = 0;
    time_t now = time(0);
    char num[100];
+   SemLock lock(sem);
 
    w1.update();
 
@@ -1558,6 +1434,8 @@ void P4d::afterUpdate()
 
 void P4d::sensorAlertCheck(time_t now)
 {
+   sensorAlertMutex.Lock();
+
    tableSensorAlert->clear();
    tableSensorAlert->setValue("KIND", "M");
 
@@ -1572,6 +1450,45 @@ void P4d::sensorAlertCheck(time_t now)
    }
 
    selectSensorAlerts->freeResult();
+   sensorAlertMutex.Unlock();
+}
+
+//***************************************************************************
+// Perform Alert Check Test
+//***************************************************************************
+
+int P4d::performAlertCheckTest()
+{
+   int status;
+   time_t last;
+
+   sensorAlertMutex.Lock();
+
+   alertMailBody = "";
+   alertMailSubject = "";
+
+   if (!selectMaxTime->find())
+   {
+      tell(eloAlways, "Warning: Got no result by 'select max(time) from samples', "
+           "can't proceed altert-mail check");
+      return fail;
+   }
+
+   last = tableSamples->getTimeValue("TIME");
+   selectMaxTime->freeResult();
+
+   tableSensorAlert->clear();
+   tableSensorAlert->setValue("ID", triggerAlertCheckTestMailFor);
+
+   if (tableSensorAlert->find())
+      return fail;
+
+   status = performAlertCheck(tableSensorAlert->getRow(), last, 0, yes/*force*/);
+   tableSensorAlert->reset();
+
+   sensorAlertMutex.Unlock();
+
+   return status;
 }
 
 //***************************************************************************
@@ -1856,6 +1773,7 @@ int P4d::updateErrors()
    Fs::ErrorInfo e;
    char timeField[5+TB] = "";
    time_t timeOne = 0;
+   SemLock lock(sem);
 
    tell(eloAlways, "Updating error list");
 
@@ -1988,7 +1906,7 @@ int P4d::sendAlertMail(const char* to)
 //***************************************************************************
 
 int P4d::add2AlertMail(cDbRow* alertRow, const char* title,
-                           double value, const char* unit)
+                       double value, const char* unit)
 {
    char* webUrl = 0;
    char* sensor = 0;

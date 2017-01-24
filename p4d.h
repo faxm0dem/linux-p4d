@@ -3,7 +3,7 @@
 // File p4d.h
 // This code is distributed under the terms and conditions of the
 // GNU GENERAL PUBLIC LICENSE. See the file LICENSE for details.
-// Date 04.11.2010 - 01.03.2016  Jörg Wendel
+// Date 04.11.2010 - 01.03.2017  Jörg Wendel
 //***************************************************************************
 
 #ifndef _P4D_H_
@@ -14,11 +14,13 @@
 //***************************************************************************
 
 #include "lib/db.h"
+#include "lib/curl.h"
+#include "lib/thread.h"
 
 #include "service.h"
 #include "p4io.h"
 #include "w1.h"
-#include "lib/curl.h"
+
 #include "HISTORY.h"
 
 #define confDirDefault "/etc/p4d"
@@ -36,12 +38,83 @@ extern int aggregateInterval;        // aggregate interval in minutes
 extern int aggregateHistory;         // history in days
 extern char* confDir;
 
+class P4d;
+
+//***************************************************************************
+// Class cP4WebThread
+//***************************************************************************
+
+class cP4WebThread : public cThread, public FroelingService
+{
+   public:
+
+      cP4WebThread(P4d* parent);
+      ~cP4WebThread();
+
+      int start();
+      int stop();
+
+      int initDb();
+      int exitDb();
+
+   protected:
+
+      virtual void action();
+      int performRequests();
+
+      int cleanupWebifRequests();
+      int callScript(const char* scriptName, const char*& result);
+
+      int getConfigItem(const char* name, char*& value, const char* def = "");
+      int setConfigItem(const char* name, const char* value);
+      int sendMail(const char* receiver, const char* subject, const char* body, const char* mimeType);
+
+      int getParameter(ConfigParameter* p);
+      int setParameter(ConfigParameter* p);
+      int setTimeRanges(TimeRanges* t);
+      int getValue(Value* v);
+      int updateMenu();
+      int updateTimeRangeData();
+      int hmSyncSysVars();
+
+      // data
+
+      cDbConnection* connection;
+
+      cDbTable* tableSamples;
+      cDbTable* tableMenu;
+      cDbTable* tableJobs;
+      cDbTable* tableConfig;
+      cDbTable* tableScripts;
+      cDbTable* tableSensorAlert;
+      cDbTable* tableTimeRanges;
+      cDbTable* tableValueFacts;
+      cDbTable* tableHmSysVars;
+
+      cDbStatement* selectPendingJobs;
+      cDbStatement* selectAllMenuItems;
+      cDbStatement* selectMaxTime;
+      cDbStatement* selectScriptByName;
+      cDbStatement* cleanupJobs;
+
+      P4Request* request;
+      Serial* serial;
+      Sem* sem;
+      cCurl* curl;
+
+      int end;
+      cCondVar waitCondition;
+      P4d* p4d;
+};
+
 //***************************************************************************
 // Class P4d
 //***************************************************************************
 
 class P4d : public FroelingService
 {
+   friend class cP4WebThread;
+
    public:
 
       // object
@@ -74,8 +147,6 @@ class P4d : public FroelingService
       int aggregate();
 
       int updateErrors();
-      int performWebifRequests();
-      int cleanupWebifRequests();
 
       int store(time_t now, const char* type, int address, double value,
                 unsigned int factor, const char* text = 0);
@@ -83,7 +154,9 @@ class P4d : public FroelingService
       void addParameter2Mail(const char* name, const char* value);
 
       void afterUpdate();
+      int performAlertCheckTest();
       void sensorAlertCheck(time_t now);
+
       int performAlertCheck(cDbRow* alertRow, time_t now, int recurse = 0, int force = no);
       int add2AlertMail(cDbRow* alertRow, const char* title,
                             double value, const char* unit);
@@ -94,12 +167,9 @@ class P4d : public FroelingService
 
       int updateSchemaConfTable();
       int updateValueFacts();
-      int updateTimeRangeData();
       int initMenu();
       int updateScripts();
-      int callScript(const char* scriptName, const char*& result);
       int hmUpdateSysVars();
-      int hmSyncSysVars();
 
       int isMailState();
       int loadHtmlHeader();
@@ -137,15 +207,19 @@ class P4d : public FroelingService
       cDbStatement* selectPendingErrors;
       cDbStatement* selectMaxTime;
       cDbStatement* selectHmSysVarByAddr;
-      cDbStatement* selectScriptByName;
       cDbStatement* selectScript;
-      cDbStatement* cleanupJobs;
 
       cDbValue rangeEnd;
 
       time_t nextAt;
       time_t startedAt;
       Sem* sem;
+
+      int triggerAlertCheckTestMailFor;
+      int triggerUpdateSchemaConf;
+      int triggerUpdateConfig;
+      int triggerInitMenu;
+      int triggerUpdateValueFacts;
 
       P4Request* request;
       Serial* serial;
@@ -175,6 +249,10 @@ class P4d : public FroelingService
       string alertMailSubject;
 
       time_t nextAggregateAt;
+
+      cMyMutex sensorAlertMutex;
+
+      cP4WebThread* webRequestThread;
 
       //
 

@@ -189,7 +189,7 @@ int Serial::look(byte& b, int timeout)
       if (errno == EINTR)
          continue;
 
-      tell(eloAlways, "Read failed, errno was %d '%s'", 
+      tell(eloAlways, "Read failed, errno was %d '%s'",
            errno, strerror(errno));
 
       return fail;
@@ -226,7 +226,7 @@ int Serial::write(void* line, int size)
 int Serial::read(void* buf, unsigned int count, int timeout)
 {
    int res;
-   uint64_t start = cTimeMs::Now();
+   uint64_t start = cMyTimeMs::Now();
 
    if (!fdDevice)
    {
@@ -236,7 +236,7 @@ int Serial::read(void* buf, unsigned int count, int timeout)
 
    while ((res = ::read(fdDevice, buf, count)) == 0)
    {
-      if (cTimeMs::Now() > start + timeout)
+      if (cMyTimeMs::Now() > start + timeout)
          return wrnTimeout;
    };
 
@@ -251,4 +251,3 @@ int Serial::read(void* buf, unsigned int count, int timeout)
 
    return res;
 }
-
