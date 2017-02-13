@@ -76,7 +76,7 @@ Run the following commands to install the Apache webserver and required packages
 groupadd www-data
 usermod -a -G www-data www-data
 apt-get update
-apt-get install apache2 php5 php5-mysql php5-gd
+apt-get install apache2 php5 php5-mysql php5-gd php5-mysqlnd
 ```
 
 Check from a remote PC if connection works a webpage with the content `It Works!` will be displayed
